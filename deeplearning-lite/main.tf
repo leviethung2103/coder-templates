@@ -135,3 +135,205 @@ module "jupyterlab" {
   version  = "1.0.8"
   agent_id = coder_agent.main.id
 }
+
+resource "coder_agent" "main" {
+  arch           = "amd64"
+  os             = "linux"
+  startup_script = <<EOT
+    #!/bin/bash
+    set -euo pipefail
+    # Create user data directory
+    mkdir -p ~/data
+    # make user share directory
+    mkdir -p ~/share
+    EOT
+
+  metadata {
+    display_name = "CPU Usage"
+    interval     = 10
+    order        = 1
+    key          = "cpu_usage"
+    script       = "coder stat cpu --host"
+  }
+
+  metadata {
+    display_name = "RAM Usage"
+    interval     = 10
+    order        = 2
+    key          = "ram_usage"
+    script       = "coder stat mem --host"
+  }
+
+  metadata {
+    display_name = "GPU Usage"
+    interval     = 10
+    order        = 3
+    key          = "gpu_usage"
+    script       = <<EOT
+      nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | awk '{printf "%s%%", $1}'
+    EOT
+  }
+
+  metadata {
+    display_name = "GPU Memory Usage"
+    interval     = 10
+    order        = 4
+    key          = "gpu_memory_usage"
+    script       = <<EOT
+      nvidia-smi --query-gpu=utilization.memory --format=csv,noheader,nounits | awk '{printf "%s%%", $1}'
+    EOT
+  }
+
+  metadata {
+    display_name = "Disk Usage"
+    interval     = 600
+    order        = 5
+    key          = "disk_usage"
+    script       = "coder stat disk $HOME"
+  }
+
+  metadata {
+    display_name = "Word of the Day"
+    interval     = 86400
+    order        = 6
+    key          = "word_of_the_day"
+    script       = <<EOT
+      #!/bin/bash
+      curl -o - --silent https://www.merriam-webster.com/word-of-the-day 2>&1 | awk ' $0 ~ "Word of the Day: [A-z]+" { print $5; exit }'
+    EOT
+  }
+
+}
+
+locals {
+  registry_name = "matifali/dockerdl"
+}
+
+data "docker_registry_image" "deeplearning" {
+  name = "${local.registry_name}:${data.coder_parameter.framework.value}"
+}
+
+resource "docker_image" "deeplearning" {
+  name          = "${local.registry_name}@${data.docker_registry_image.deeplearning.sha256_digest}"
+  pull_triggers = [data.docker_registry_image.deeplearning.sha256_digest]
+  keep_locally  = true
+}
+
+#Volumes Resources
+#home_volume
+resource "docker_volume" "home_volume" {
+  name = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}-home"
+}
+
+#usr_volume
+resource "docker_volume" "usr_volume" {
+  name = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}-usr"
+}
+
+#etc_volume
+resource "docker_volume" "etc_volume" {
+  name = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}-etc"
+}
+
+#opt_volume
+resource "docker_volume" "opt_volume" {
+  name = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}-opt"
+}
+
+resource "docker_container" "workspace" {
+  count    = data.coder_workspace.me.start_count
+  image    = docker_image.deeplearning.image_id
+  memory   = data.coder_parameter.ram.value * 1024
+  gpus     = "all"
+  name     = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}"
+  hostname = lower(data.coder_workspace.me.name)
+  dns      = ["1.1.1.1"]
+  command  = ["sh", "-c", replace(coder_agent.main.init_script, "127.0.0.1", "host.docker.internal")]
+  env      = ["CODER_AGENT_TOKEN=${coder_agent.main.token}"]
+  restart  = "unless-stopped"
+
+  devices {
+    host_path = "/dev/nvidia0"
+  }
+  devices {
+    host_path = "/dev/nvidiactl"
+  }
+  devices {
+    host_path = "/dev/nvidia-uvm-tools"
+  }
+  devices {
+    host_path = "/dev/nvidia-uvm"
+  }
+  devices {
+    host_path = "/dev/nvidia-modeset"
+  }
+
+  host {
+    host = "host.docker.internal"
+    ip   = "host-gateway"
+  }
+
+  ipc_mode = "host"
+
+  # users home directory
+  volumes {
+    container_path = "/home/coder"
+    volume_name    = docker_volume.home_volume.name
+    read_only      = false
+  }
+  volumes {
+    container_path = "/usr/"
+    volume_name    = docker_volume.usr_volume.name
+    read_only      = false
+  }
+  volumes {
+    container_path = "/etc/"
+    volume_name    = docker_volume.etc_volume.name
+    read_only      = false
+  }
+  volumes {
+    container_path = "/opt/"
+    volume_name    = docker_volume.opt_volume.name
+    read_only      = false
+  }
+  # users data directory
+  volumes {
+    container_path = "/home/coder/data/"
+    host_path      = "/data/${data.coder_workspace_owner.me.name}/"
+    read_only      = false
+  }
+  # shared data directory
+  volumes {
+    container_path = "/home/coder/share"
+    host_path      = "/data/share/"
+    read_only      = true
+  }
+
+  # Add labels in Docker to keep track of orphan resources.
+  labels {
+    label = "coder.owner"
+    value = data.coder_workspace_owner.me.name
+  }
+  labels {
+    label = "coder.owner_id"
+    value = data.coder_workspace_owner.me.id
+  }
+  labels {
+    label = "coder.workspace_id"
+    value = data.coder_workspace.me.id
+  }
+  labels {
+    label = "coder.workspace_name"
+    value = data.coder_workspace.me.name
+  }
+}
+
+resource "coder_metadata" "workspace" {
+  count       = data.coder_workspace.me.start_count
+  resource_id = docker_container.workspace[count.index].id
+  daily_cost  = 50
+  item {
+    key   = "Framework"
+    value = data.coder_parameter.framework.option[index(data.coder_parameter.framework.option.*.value, data.coder_parameter.framework.value)].name
+  }
+}
